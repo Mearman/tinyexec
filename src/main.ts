@@ -65,6 +65,16 @@ export interface Options extends CommonOptions {
   nodeOptions: SpawnOptions;
   persist: boolean;
   stdin: Result | ExecProcess | string;
+  /**
+   * How long, in milliseconds, to wait for the child's stdio streams to
+   * go quiet after the child exits before force-destroying them. The
+   * destroy is required when a grandchild process inherits the piped
+   * fds and keeps them open (which prevents the natural 'end' event
+   * from ever firing). Setting this too low races with kernel pipe
+   * drain and drops trailing data; the default of 50 is a conservative
+   * choice that gives the pipe time to flush on a busy event loop.
+   */
+  exitDrainTimeout: number;
 }
 
 export interface SyncOptions extends CommonOptions {
@@ -81,7 +91,8 @@ export interface TinyExec {
 
 const defaultOptions: Partial<Options> = {
   timeout: undefined,
-  persist: false
+  persist: false,
+  exitDrainTimeout: 50
 };
 
 const defaultSyncOptions: Partial<SyncOptions> = {
@@ -400,50 +411,35 @@ export class ExecProcess implements Result {
       return;
     }
 
-    const IDLE_MS = 50;
-    let outEnded = !out;
-    let errEnded = !err;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    const drainTimeout = this._options.exitDrainTimeout ?? 50;
 
-    const cleanup = (): void => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      out?.off('data', reschedule);
-      err?.off('data', reschedule);
+    const watch = (stream: Readable | undefined): void => {
+      if (!stream) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const reschedule = (): void => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => stream.destroy(), drainTimeout);
+        timer.unref();
+      };
+
+      const stop = (): void => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        stream.off('data', reschedule);
+      };
+
+      stream.on('data', reschedule);
+      stream.once('end', stop);
+      stream.once('close', stop);
+
+      reschedule();
     };
 
-    const fire = (): void => {
-      timer = undefined;
-      if (!outEnded) out?.destroy();
-      if (!errEnded) err?.destroy();
-      cleanup();
-    };
-
-    const reschedule = (): void => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(fire, IDLE_MS);
-      timer.unref();
-    };
-
-    const onOutEnd = (): void => {
-      outEnded = true;
-      if (errEnded) cleanup();
-    };
-    const onErrEnd = (): void => {
-      errEnded = true;
-      if (outEnded) cleanup();
-    };
-
-    out?.on('data', reschedule);
-    out?.once('end', onOutEnd);
-    out?.once('close', onOutEnd);
-    err?.on('data', reschedule);
-    err?.once('end', onErrEnd);
-    err?.once('close', onErrEnd);
-
-    reschedule();
+    watch(out);
+    watch(err);
   };
 
   protected _onClose = (): void => {
