@@ -443,60 +443,67 @@ if (!isWindows) {
       }
     });
 
-    test('does not lose data under concurrent invocations', {timeout: 30_000}, async () => {
-      // Buffer-drain race regression (tinyexec 1.2.3): when many x() calls
-      // are in flight, the destroy-on-exit fires before the kernel pipe has
-      // drained on Linux, dropping the trailing chunk of stdout.
-      //
-      // The child writes N lines and exits naturally. We run K concurrent
-      // invocations per round across R rounds and assert every run gets
-      // exactly N lines via both await and iterator paths.
-      const LINES = 2_000;
-      const CONCURRENT = 8;
-      const ROUNDS = 2;
+    test(
+      'does not lose data under concurrent invocations',
+      {timeout: 30_000},
+      async () => {
+        // Buffer-drain race regression (tinyexec 1.2.3): when many x() calls
+        // are in flight, the destroy-on-exit fires before the kernel pipe has
+        // drained on Linux, dropping the trailing chunk of stdout.
+        //
+        // The child writes N lines and exits naturally. We run K concurrent
+        // invocations per round across R rounds and assert every run gets
+        // exactly N lines via both await and iterator paths.
+        const LINES = 2_000;
+        const CONCURRENT = 8;
+        const ROUNDS = 2;
 
-      const childScript = `
+        const childScript = `
         const n = ${LINES};
         for (let i = 0; i < n; i++) {
           process.stdout.write('line-' + i + '\\n');
         }
       `;
 
-      const runAwait = async (): Promise<number> => {
-        const result = await x('node', ['-e', childScript]);
-        return result.stdout
-          .split(/\r?\n/)
-          .filter((l: string) => l.length > 0).length;
-      };
+        const runAwait = async (): Promise<number> => {
+          const result = await x('node', ['-e', childScript]);
+          return result.stdout
+            .split(/\r?\n/)
+            .filter((l: string) => l.length > 0).length;
+        };
 
-      const runIterator = async (): Promise<number> => {
-        let received = 0;
-        for await (const _line of x('node', ['-e', childScript])) {
-          received++;
-        }
-        return received;
-      };
+        const runIterator = async (): Promise<number> => {
+          let received = 0;
+          for await (const _line of x('node', ['-e', childScript])) {
+            received++;
+          }
+          return received;
+        };
 
-      const observed: {mode: string; received: number}[] = [];
-      for (let r = 0; r < ROUNDS; r++) {
-        const tasks = [
-          ...Array.from({length: CONCURRENT}, () => runAwait()),
-          ...Array.from({length: CONCURRENT}, () => runIterator())
-        ];
-        const results = await Promise.all(tasks);
-        for (let i = 0; i < CONCURRENT; i++) {
-          observed.push({mode: 'await', received: results[i]});
-          observed.push({mode: 'iterator', received: results[CONCURRENT + i]});
+        const observed: {mode: string; received: number}[] = [];
+        for (let r = 0; r < ROUNDS; r++) {
+          const tasks = [
+            ...Array.from({length: CONCURRENT}, () => runAwait()),
+            ...Array.from({length: CONCURRENT}, () => runIterator())
+          ];
+          const results = await Promise.all(tasks);
+          for (let i = 0; i < CONCURRENT; i++) {
+            observed.push({mode: 'await', received: results[i]});
+            observed.push({
+              mode: 'iterator',
+              received: results[CONCURRENT + i]
+            });
+          }
         }
+
+        const losses = observed.filter((o) => o.received < LINES);
+        expect(
+          losses,
+          `${losses.length}/${observed.length} runs lost data; ` +
+            `worst ${losses[0]?.mode}=${losses[0]?.received}/${LINES}`
+        ).toEqual([]);
       }
-
-      const losses = observed.filter((o) => o.received < LINES);
-      expect(
-        losses,
-        `${losses.length}/${observed.length} runs lost data; ` +
-          `worst ${losses[0]?.mode}=${losses[0]?.received}/${LINES}`
-      ).toEqual([]);
-    });
+    );
   });
 
   describe('exec (unix-like) (sync)', () => {
