@@ -374,10 +374,14 @@ export class ExecProcess implements Result {
   };
 
   protected _onExit = (): void => {
-    // Node emits 'exit' before stdio streams have drained. Use setImmediate
-    // to let buffered data flow through before destroying the streams.
-    // If grandchild processes hold the pipe fds open, they would never fire
-    // 'close', so we destroy here to unblock readStream and combineStreams.
+    // Node emits 'exit' before stdio streams have drained. If grandchild
+    // processes hold the pipe fds open after the child exits, the streams
+    // never fire 'end' and readStream/combineStreams would wait forever.
+    // We therefore force-destroy them, but with a grace period — letting
+    // any data still en route from the kernel pipe flow through first.
+    // Without the grace period (the setImmediate approach used in 1.2.3)
+    // destroy races with kernel pipe drain on Linux under concurrent
+    // tinyexec invocations and the trailing chunk is dropped.
     const out =
       this._streamOut && !pipedStreams.has(this._streamOut)
         ? this._streamOut
@@ -389,10 +393,28 @@ export class ExecProcess implements Result {
     if (!out && !err) {
       return;
     }
-    setImmediate(() => {
-      out?.destroy();
-      err?.destroy();
-    });
+
+    let outDone = !out;
+    let errDone = !err;
+
+    const timer = setTimeout(() => {
+      if (!outDone) out?.destroy();
+      if (!errDone) err?.destroy();
+    }, 100);
+    timer.unref();
+
+    const onOutEnd = (): void => {
+      outDone = true;
+      if (errDone) clearTimeout(timer);
+    };
+    const onErrEnd = (): void => {
+      errDone = true;
+      if (outDone) clearTimeout(timer);
+    };
+    out?.once('end', onOutEnd);
+    out?.once('close', onOutEnd);
+    err?.once('end', onErrEnd);
+    err?.once('close', onErrEnd);
   };
 
   protected _onClose = (): void => {
